@@ -1,8 +1,9 @@
 """
-Fyers Callback Service for Render.com
-This service stores the auth code and makes it accessible for automated retrieval.
+Fyers & Dhan Callback Service for Render.com
 
-Deploy this to Render.com and update your redirect_uri in the Fyers app dashboard.
+This service stores the Fyers auth code AND Dhan tokenId and exposes endpoints for retrieval/clearing.
+
+Deploy this to Render.com and set as your redirect_uri for both Fyers and Dhan API dashboards.
 """
 
 from flask import Flask, request, jsonify
@@ -11,16 +12,24 @@ import time
 
 app = Flask(__name__)
 
-# In-memory storage for auth code (persists for the lifetime of the service)
+# In-memory storage for Fyers auth code/state and Dhan tokenId (persists for the lifetime of the service)
 # For production, consider using Redis or a database
 auth_storage = {
-    "auth_code": None,
-    "state": None,
-    "timestamp": None
+    "fyers": {
+        "auth_code": None,
+        "state": None,
+        "timestamp": None,
+    },
+    "dhan": {
+        "token_id": None,
+        "timestamp": None,
+    }
 }
 
+# ---------- FYERS CALLBACK & API ----------
+
 @app.route('/callback')
-def callback():
+def fyers_callback():
     """
     Fyers redirects here with auth_code and state as query parameters.
     We store them and display them on the page.
@@ -28,11 +37,11 @@ def callback():
     auth_code = request.args.get("auth_code")
     state_recv = request.args.get("state")
     
-    # Store the auth code
+    # Store the Fyers auth code
     if auth_code:
-        auth_storage["auth_code"] = auth_code
-        auth_storage["state"] = state_recv
-        auth_storage["timestamp"] = time.time()
+        auth_storage["fyers"]["auth_code"] = auth_code
+        auth_storage["fyers"]["state"] = state_recv
+        auth_storage["fyers"]["timestamp"] = time.time()
     
     # Display on page (for manual viewing)
     return f"""
@@ -50,16 +59,15 @@ def callback():
 @app.route('/get-auth-code')
 def get_auth_code():
     """
-    API endpoint to retrieve the stored auth code.
+    API endpoint to retrieve the stored Fyers auth code.
     Returns JSON with the auth code or error message.
-    Also checks if code is fresh (not older than 5 minutes).
+    Also checks if code is fresh (not older than 3 minutes).
     """
-    if auth_storage["auth_code"]:
+    fyers_data = auth_storage["fyers"]
+    if fyers_data["auth_code"]:
         # Check if code is fresh (auth codes expire quickly, typically within 1-2 minutes)
         current_time = time.time()
-        code_age = current_time - auth_storage["timestamp"] if auth_storage["timestamp"] else float('inf')
-        
-        # Fyers auth codes typically expire in 60-120 seconds, so we'll use 3 minutes as max age
+        code_age = current_time - fyers_data["timestamp"] if fyers_data["timestamp"] else float('inf')
         max_age_seconds = 180
         
         if code_age > max_age_seconds:
@@ -71,9 +79,9 @@ def get_auth_code():
         
         return jsonify({
             "success": True,
-            "auth_code": auth_storage["auth_code"],
-            "state": auth_storage["state"],
-            "timestamp": auth_storage["timestamp"],
+            "auth_code": fyers_data["auth_code"],
+            "state": fyers_data["state"],
+            "timestamp": fyers_data["timestamp"],
             "code_age_seconds": code_age
         })
     else:
@@ -85,26 +93,105 @@ def get_auth_code():
 @app.route('/clear-auth-code', methods=['POST', 'GET'])
 def clear_auth_code():
     """
-    Clear the stored auth code after successful use.
+    Clear the stored Fyers auth code after successful use.
     This prevents reuse of already-used codes.
     """
-    auth_storage["auth_code"] = None
-    auth_storage["state"] = None
-    auth_storage["timestamp"] = None
+    auth_storage["fyers"]["auth_code"] = None
+    auth_storage["fyers"]["state"] = None
+    auth_storage["fyers"]["timestamp"] = None
     return jsonify({
         "success": True,
-        "message": "Auth code cleared successfully"
+        "message": "Fyers auth code cleared successfully"
     })
+
+# ---------- DHAN CALLBACK & API ----------
+
+@app.route('/callback/dhan')
+def dhan_callback():
+    """
+    Dhan redirects here after user browser login,
+    with tokenId as a query parameter in the URL (see docs).
+    Example: /callback/dhan?tokenId=XXXXXXX
+    """
+    token_id = request.args.get("tokenId")
+    store_time = time.time()
+    
+    # Store Dhan tokenId if present
+    if token_id:
+        auth_storage["dhan"]["token_id"] = token_id
+        auth_storage["dhan"]["timestamp"] = store_time
+
+    # Display on page for user/manual check
+    return f"""
+    <html>
+        <head><title>Dhan tokenId</title></head>
+        <body style="font-family: Arial; padding: 20px;">
+            <h2>Dhan Authentication</h2>
+            <p><strong>tokenId:</strong> {token_id or 'None'}</p>
+            <p style="color: green;">✅ tokenId stored! Your script can now retrieve it automatically.</p>
+            <p style="font-size: 13px; color: #888;">(Proceed to use tokenId in step 3 of the Dhan OAuth docs.)</p>
+        </body>
+    </html>
+    """
+
+@app.route('/get-dhan-token')
+def get_dhan_token():
+    """
+    API endpoint to retrieve the stored Dhan tokenId.
+    tokenId can be used to obtain an access token via Dhan APIs (app/consumeApp-consent).
+    tokenIds expire quickly, so we set a freshness requirement (3 min).
+    """
+    dhan_data = auth_storage["dhan"]
+    if dhan_data["token_id"]:
+        current_time = time.time()
+        code_age = current_time - dhan_data["timestamp"] if dhan_data["timestamp"] else float('inf')
+        max_age_seconds = 180  # 3 min, adjust as needed per Dhan docs
+        
+        if code_age > max_age_seconds:
+            return jsonify({
+                "success": False,
+                "message": f"tokenId expired (age: {int(code_age)}s, max: {max_age_seconds}s). Please login on Dhan again.",
+                "code_age": code_age
+            }), 410
+        
+        return jsonify({
+            "success": True,
+            "token_id": dhan_data["token_id"],
+            "timestamp": dhan_data["timestamp"],
+            "code_age_seconds": code_age
+        })
+    else:
+        return jsonify({
+            "success": False,
+            "message": "No Dhan tokenId available yet. Complete the Dhan OAuth browser login first."
+        }), 404
+
+@app.route('/clear-dhan-token', methods=['POST', 'GET'])
+def clear_dhan_token():
+    """
+    Clear the stored Dhan tokenId after successful use.
+    """
+    auth_storage["dhan"]["token_id"] = None
+    auth_storage["dhan"]["timestamp"] = None
+    return jsonify({
+        "success": True,
+        "message": "Dhan tokenId cleared successfully"
+    })
+
+# ---------- INDEX / HEALTH ----------
 
 @app.route('/')
 def index():
-    """Health check endpoint"""
+    """Health check endpoint with all available Redirect endpoints."""
     return jsonify({
         "status": "running",
         "endpoints": {
             "/callback": "Fyers redirect endpoint (stores auth code)",
-            "/get-auth-code": "API to retrieve stored auth code (checks freshness)",
-            "/clear-auth-code": "Clear stored auth code after use"
+            "/get-auth-code": "API to retrieve stored Fyers auth code (checks freshness)",
+            "/clear-auth-code": "Clear stored Fyers auth code after use",
+            "/callback/dhan": "Dhan redirect endpoint (stores tokenId)",
+            "/get-dhan-token": "API to retrieve stored Dhan tokenId (checks freshness)",
+            "/clear-dhan-token": "Clear stored Dhan tokenId after use"
         }
     })
 
